@@ -1,31 +1,50 @@
 #!/usr/bin/env python
-import os, torch, math, argparse
+import os, sys, torch, math, argparse, importlib
 from pathlib import Path
 from tqdm import tqdm
-from frame_utils_dali import DaliHevcDataset, camera_size, seq_len
+from frame_utils import DaliHevcDataset, AVHevcDataset, camera_size, seq_len
 from modules import DistortionNet, segnet_sd_path, posenet_sd_path
-# import YourSubmissionDataset
 
 def main():
   parser = argparse.ArgumentParser(description="Evaluate a comma2k19 compression submission.")
   parser.add_argument("--batch-size", type=int, default=16, help="dataloader batch size")
   parser.add_argument("--num-threads", type=int, default=2, help="DALI worker threads")
   parser.add_argument("--prefetch-queue-depth", type=int, default=4, help="DALI prefetch depth")
-  parser.add_argument("--compressed-archive-path", type=Path, default='./comma2k19_submission.zip', help="zip with compressed videos path")
-  parser.add_argument("--compressed-deflated-dir", type=Path, default='./deflated_comma2k19_submission/', help="deflated compressed videos path")
+  parser.add_argument("--compressed-archive-path", type=Path, default='./submission.zip', help="zip with compressed videos path")
+  parser.add_argument("--compressed-deflated-dir", type=Path, default='./submission/', help="compressed videos path")
   parser.add_argument("--uncompressed-archive-path", type=Path, default='./test_videos.zip', help="zip with original uncompressed videos path")
-  parser.add_argument("--uncompressed-deflated-dir", type=Path, default='./deflated_test_videos/', help="deflated original uncompressed videos path")
+  parser.add_argument("--uncompressed-deflated-dir", type=Path, default='./test_videos/', help="original uncompressed videos path")
   parser.add_argument("--seed", type=int, default=1234, help="RNG seed")
+  parser.add_argument("--device", type=str, default=None, help="device: 'cpu' or 'cuda' (default: auto-detect)")
+  parser.add_argument("--dataloader", type=Path, required=True, help="path to a .py file exporting DatasetClass")
   args = parser.parse_args()
 
-  local_rank = int(os.getenv("LOCAL_RANK", "0"))
-  rank = int(os.getenv("RANK", "0"))
-  world_size = int(os.getenv("WORLD_SIZE", "1"))
-  is_distributed = world_size > 1
-  assert world_size == 1 or torch.distributed.is_available()
-  assert torch.cuda.is_available()
-  device = torch.device("cuda", local_rank)
-  torch.cuda.set_device(device)
+  if args.device is not None:
+    use_cuda = args.device != 'cpu'
+  else:
+    use_cuda = torch.cuda.is_available()
+
+  if use_cuda:
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    rank = int(os.getenv("RANK", "0"))
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    is_distributed = world_size > 1
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    DefaultDatasetClass = DaliHevcDataset
+  else:
+    local_rank = 0
+    rank = 0
+    world_size = 1
+    is_distributed = False
+    device = torch.device("cpu")
+    DefaultDatasetClass = AVHevcDataset
+
+  spec = importlib.util.spec_from_file_location("submission_dataloader", args.dataloader)
+  mod = importlib.util.module_from_spec(spec)
+  sys.modules[spec.name] = mod
+  spec.loader.exec_module(mod)
+  SubmissionDatasetClass = mod.DatasetClass
 
   if rank == 0:
     printed_args = ["=== Evaluation config ==="]
@@ -38,18 +57,16 @@ def main():
   distortion_net = DistortionNet().eval().to(device=device)
   distortion_net.load_state_dicts(posenet_sd_path, segnet_sd_path, device)
 
-  with open("stage_1_test_video_names.txt", "r") as file:
+  with open("public_test_video_names.txt", "r") as file:
     test_video_names = [line.strip() for line in file.readlines()]
 
-  ds_gt = DaliHevcDataset(test_video_names, archive_path=args.uncompressed_archive_path, data_dir=args.uncompressed_deflated_dir, batch_size=args.batch_size, device_id=local_rank, num_threads=args.num_threads, seed=args.seed, prefetch_queue_depth=args.prefetch_queue_depth)
+  ds_gt = DefaultDatasetClass(test_video_names, archive_path=args.uncompressed_archive_path, data_dir=args.uncompressed_deflated_dir, batch_size=args.batch_size, device=device, num_threads=args.num_threads, seed=args.seed, prefetch_queue_depth=args.prefetch_queue_depth)
   ds_gt.prepare_data()
   dl_gt = torch.utils.data.DataLoader(ds_gt, batch_size=None, num_workers=0)
 
-  # replace with your YourSubmissionDataset implementation
-  ds_comp = DaliHevcDataset(test_video_names, archive_path=args.compressed_archive_path, data_dir=args.compressed_deflated_dir, batch_size=args.batch_size, device_id=local_rank, num_threads=args.num_threads, seed=args.seed, prefetch_queue_depth=args.prefetch_queue_depth)
+  ds_comp = SubmissionDatasetClass(test_video_names, archive_path=args.compressed_archive_path, data_dir=args.compressed_deflated_dir, batch_size=args.batch_size, device=device, num_threads=args.num_threads, seed=args.seed, prefetch_queue_depth=args.prefetch_queue_depth)
   ds_comp.prepare_data()
   dl_comp = torch.utils.data.DataLoader(ds_comp, batch_size=None, num_workers=0)
-  # end replace
 
   if rank == 0:
     compressed_size = sum(file.stat().st_size for file in args.compressed_deflated_dir.rglob('*') if file.is_file())
@@ -60,6 +77,8 @@ def main():
   posenet_dists, segnet_dists, batch_sizes = torch.zeros([], device=device), torch.zeros([], device=device), torch.zeros([], device=device)
   with torch.inference_mode():
     for (_,_,batch_gt), (_,_,batch_comp) in tqdm(dl):
+      batch_gt = batch_gt.to(device)
+      batch_comp = batch_comp.to(device)
       assert list(batch_comp.shape)[1:] == [seq_len, camera_size[1], camera_size[0], 3], f"unexpected batch shape: {batch_comp.shape}"
       assert batch_gt.shape == batch_comp.shape, f"ground truth and compressed batch shape mismatch: {batch_gt.shape} vs {batch_comp.shape}"
       posenet_dist, segnet_dist = distortion_net.compute_distortion(batch_gt, batch_comp)

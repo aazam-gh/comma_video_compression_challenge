@@ -5,7 +5,7 @@ import segmentation_models_pytorch as smp
 from pathlib import Path
 from safetensors.torch import load_file
 from collections import namedtuple
-from frame_utils_dali import rgb_to_yuv6, affine_transform_image, camera_size, ecam_model_input_size, fcam_model_input_size, camera_intrinsics, ecam_model_intrinsics, fcam_model_intrinsics, segnet_model_input_size
+from frame_utils import rgb_to_yuv6, camera_size, segnet_model_input_size
 
 Head = namedtuple('Head', ['name', 'hidden', 'out'])
 HERE = Path(__file__).resolve().parent
@@ -17,9 +17,9 @@ BN_EPS = 0.001
 BN_MOM = 0.01
 VISION_FEATURES = 2048
 SUMMARY_FEATURES = 512
-IN_CHANS = 6 * 2 * 2
+IN_CHANS = 6 * 2
 ACT_LAYER = 'gelu_tanh'
-HEADS = [Head('pose', 32, 12), Head('road_transform', 32, 12), Head('lane_lines', 64, 528), Head('road_edges', 32, 264)]
+HEADS = [Head('pose', 32, 12)]
 
 class AllNorm(nn.Module):
   def __init__(self, num_features: int, eps: float = BN_EPS, momentum: float = BN_MOM, affine: bool = True):
@@ -66,9 +66,8 @@ class PoseNet(nn.Module):
   def preprocess_input(self, x):
     batch_size, seq_len, *_ = x.shape
     x = einops.rearrange(x, 'b t c h w -> (b t) c h w', b=batch_size, t=seq_len, c=3)
-    ecam_x = affine_transform_image(x, from_size=camera_size, to_size=ecam_model_input_size, from_intrinsics=camera_intrinsics, to_intrinsics=ecam_model_intrinsics)
-    fcam_x = affine_transform_image(x, from_size=camera_size, to_size=fcam_model_input_size, from_intrinsics=camera_intrinsics, to_intrinsics=fcam_model_intrinsics)
-    return einops.rearrange(rgb_to_yuv6(torch.stack([ecam_x, fcam_x])), 'n (b t) c h w -> b (n t c) h w', b=batch_size, t=seq_len, n=2, c=6)
+    x = torch.nn.functional.interpolate(x, size=(segnet_model_input_size[1], segnet_model_input_size[0]), mode='bilinear')
+    return einops.rearrange(rgb_to_yuv6(x), '(b t) c h w -> b (t c) h w', b=batch_size, t=seq_len, c=6)
 
   def forward(self, x):
     vision_out = self.vision((x - self._mean) / self._std)
@@ -89,8 +88,8 @@ class PoseNet(nn.Module):
     os.close(f)
     x = self.preprocess_input(x)
     out = self(x)
-    c = 0 # y00 of fcam + ecam animated for the seq_len consecutive frames - change c to see other yuv channels
-    imgs = einops.rearrange(x, 'b (n t c) h w -> b t c (n h) w', t=seq_len, n=2, c=6)[idx, :, c, ...].to(dtype=torch.uint8).cpu().numpy()
+    c = 0 # y00 animated for the seq_len consecutive frames - change c to see other yuv channels
+    imgs = einops.rearrange(x, 'b (t c) h w -> b t c h w', t=seq_len, c=6)[idx, :, c, ...].to(dtype=torch.uint8).cpu().numpy()
     imgs = [Image.fromarray(img) for img in imgs]
     imgs[0].save(filename, format="GIF", save_all=True, append_images=imgs[1:],  loop=0, duration=int(1000 / 1), optimize=True, disposal=2)
     viewer.show_file(filename)
@@ -149,13 +148,13 @@ class DistortionNet(nn.Module):
     return self.posenet.compute_distortion(posenet_out_x, posenet_out_y), self.segnet.compute_distortion(segnet_out_x, segnet_out_y)
 
 if __name__ == "__main__":
-  from frame_utils_dali import DaliHevcDataset, seq_len, camera_size
+  from frame_utils import DaliHevcDataset, seq_len, camera_size
   batch_size = 8
   device = torch.device('cuda', 0)
-  files = ['b0c9d2329ad1606b|2018-07-29--11-17-20/7/video.hevc']
-  uncompressed_archive_path = Path('./test_videos.zip')
-  uncompressed_data_dir = Path('./deflated_test_videos/')
-  ds = DaliHevcDataset(files, archive_path=uncompressed_archive_path, data_dir=uncompressed_data_dir, batch_size=batch_size, device_id=device.index)
+  files = (HERE / 'public_test_video_names.txt').read_text().splitlines()
+  uncompressed_archive_path = None # Path('./test_videos.zip')
+  uncompressed_data_dir = Path('./test_videos/')
+  ds = DaliHevcDataset(files, archive_path=uncompressed_archive_path, data_dir=uncompressed_data_dir, batch_size=batch_size, device=device)
   segnet = SegNet().eval().to(device)
   segnet_sd = load_file(segnet_sd_path, device=str(device))
   segnet.load_state_dict(segnet_sd)

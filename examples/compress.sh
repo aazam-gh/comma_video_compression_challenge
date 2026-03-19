@@ -31,7 +31,7 @@ done
 
 
 TMPDIR="$(mktemp -d)"
-OUTDIR="$PD/deflated_comma2k19_submission/"
+OUTDIR="$PD/submission/"
 
 export CRF IN_DIR TMPDIR SCALE VIDEO_NAMES_FILE JOBS
 
@@ -51,6 +51,7 @@ head -n "$(wc -l < "$VIDEO_NAMES_FILE")" "$VIDEO_NAMES_FILE" | xargs -P"$JOBS" -
     SCALE_VF="-vf scale=trunc(iw*${SCALE}/2)*2:trunc(ih*${SCALE}/2)*2:flags=lanczos"
   fi
 
+  # just cpu libx265
   ffmpeg -nostdin -y -hide_banner -loglevel warning \
     -r 20 -fflags +genpts -i "$IN" \
     ${SCALE_VF} \

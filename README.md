@@ -34,26 +34,28 @@ git lfs pull
 # uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# gpu required... pick one: cu126/ cu128 / cu130
-uv sync --group cu126
+# pick one: cu126/ cu128 / cu130 / cpu
+uv sync --group cu128
 
 # activate or use "uv run python ..."
 source .venv/bin/activate
 
-# download videos
-curl -fLO https://huggingface.co/datasets/commaai/comma2k19/resolve/main/compression_challenge/test_videos.zip
+# download test videos
+while IFS= read -r name; do
+  curl -fL --create-dirs -o "test_videos/$name" "https://huggingface.co/datasets/commaai/comma2k19/resolve/main/compression_challenge/$(echo "$name" | sed 's/|/%7C/g')"
+done < public_test_video_names.txt
 
 # test dataloaders
-python frame_utils_dali.py
+python frame_utils.py
 
 # test models
 python modules.py
 
-# naively recompress one video
-bash examples/hevc_recompress.sh --crf 30 --scale 1 --in-dir deflated_test_videos/ --jobs 1 --video-names-file stage_1_test_video_names.txt
+# naively recompress
+bash examples/compress.sh --crf 30 --scale 1 --in-dir test_videos/ --jobs 1 --video-names-file public_test_video_names.txt
 
 # evaluate the naive recompression strategy
-torchrun --nproc-per-node 1 evaluate.py  # or just python evaluate.py
+torchrun --nproc-per-node 1 evaluate.py  --dataloader examples/dataloader.py # or just python evaluate.py --dataloader examples/dataloader.py
 ```
 
 If everything worked as expected, this should producce a `report.txt` file with this content:
@@ -61,43 +63,39 @@ If everything worked as expected, this should producce a `report.txt` file with 
 ```
 === Evaluation config ===
   batch_size: 16
-  compressed_archive_path: comma2k19_submission.zip
-  compressed_deflated_dir: deflated_comma2k19_submission
+  compressed_archive_path: submission.zip
+  compressed_deflated_dir: submission
+  dataloader: examples/dataloader.py
+  device: None
   num_threads: 2
   prefetch_queue_depth: 4
   seed: 1234
   uncompressed_archive_path: test_videos.zip
-  uncompressed_deflated_dir: deflated_test_videos
+  uncompressed_deflated_dir: test_videos
 === Evaluation results over 600 samples ===
-  Average PoseNet Distortion: 0.01504754
-  Average SegNet Distortion: 0.00381063
+  Average PoseNet Distortion: 0.06430182
+  Average SegNet Distortion: 0.00381109
   Submission file size (deflated): 14428760.00000000 bytes
-  Original uncompressed size (deflated): 2399626528.00000000 bytes
-  Compression Rate (deflated): 0.00601292
-  Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = 0.91929734
+  Original uncompressed size (deflated): 37533786.00000000 bytes
+  Compression Rate (deflated): 0.38442059
+  Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = 10.79350826
 ```
 
 ## submission format
-```
-WIP
 
-```
-
-`YourSubmissionDataset` should be a subclass of `torch.utils.data.IterableDataset` with the following signature and methods
+`DatasetClass` should be a subclass of `torch.utils.data.IterableDataset` defined in a python file, with the following signature and methods
 
 ```python
 
-class YourSubmissionDataset(torch.utils.data.IterableDataset):
+class DatasetClass(torch.utils.data.IterableDataset):
   def __init__(
       self,
-      file_names: list[str],
+      file_names: List[str],
       archive_path: Path,
+      data_dir: Path,
       batch_size: int,
-      device_id: int,
-      **kwargs,
-  ):
-      self.file_names = file_names
-      self.archive_path = archive_path
+      ...
+      ):
 
   def prepare_data(self):
     # called by all ranks

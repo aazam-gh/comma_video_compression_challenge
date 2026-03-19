@@ -10,15 +10,20 @@ dependencies = [
   "segmentation-models-pytorch",
   "tqdm",
   "pillow",
+  "av",
 ]
 
 [dependency-groups]
+cpu = ["torch", "torchvision"]
 cu126 = ["torch", "torchvision", "nvidia-dali-cuda120"]
 cu128 = ["torch", "torchvision", "nvidia-dali-cuda120"]
 cu130 = ["torch", "torchvision", "nvidia-dali-cuda130"]
 
 [tool.uv]
 conflicts = [
+  [{ group = "cpu" }, { group = "cu126" }],
+  [{ group = "cpu" }, { group = "cu128" }],
+  [{ group = "cpu" }, { group = "cu130" }],
   [{ group = "cu126" }, { group = "cu128" }],
   [{ group = "cu126" }, { group = "cu130" }],
   [{ group = "cu128" }, { group = "cu130" }],
@@ -26,11 +31,13 @@ conflicts = [
 
 [tool.uv.sources]
 torch = [
+  { index = "pytorch-cpu", group = "cpu" },
   { index = "pytorch-cu126", group = "cu126" },
   { index = "pytorch-cu128", group = "cu128" },
   { index = "pytorch-cu130", group = "cu130" },
 ]
 torchvision = [
+  { index = "pytorch-cpu", group = "cpu" },
   { index = "pytorch-cu126", group = "cu126" },
   { index = "pytorch-cu128", group = "cu128" },
   { index = "pytorch-cu130", group = "cu130" },
@@ -42,6 +49,11 @@ nvidia-dali-cuda120 = [
 nvidia-dali-cuda130 = [
   { index = "nvidia", group = "cu130" },
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu/"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
