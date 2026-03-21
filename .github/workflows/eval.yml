@@ -24,6 +24,11 @@ on:
 jobs:
   test:
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      UV_GROUP: ${{ inputs.runner == 'linux-nvidia-t4' && 'cu128' || 'cpu' }}
+      EVAL_DEVICE: ${{ inputs.runner == 'linux-nvidia-t4' && 'cuda' || 'cpu' }}
+    
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,11 +60,11 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies (cpu)
-        run: uv sync --group cpu
+        run: uv sync --group "$UV_GROUP"
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       # TODO: make an arg
       - name: Evaluate
-        run: uv run --group cpu bash evaluate.sh --device cpu --submission-dir ./submissions/baseline
+        run: uv run --group "$UV_GROUP" bash evaluate.sh --device "$EVAL_DEVICE" --submission-dir ./submissions/baseline
