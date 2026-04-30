@@ -14,6 +14,7 @@ echo "Pipeline complete. Packaging artifacts..."
 mkdir -p "$ARCHIVE_DIR"
 cd "$ARCHIVE_DIR"
 
-zip -0 "${HERE}/archive.zip" *.br
+# Include all compressed artifacts: model, masks (both frames), poses, color hints
+zip -0 "${HERE}/archive.zip" model.pt.br mask.obu.br pose.npy.br color.npy.br
 
 echo "Done! Final payload saved to: ${HERE}/archive.zip"

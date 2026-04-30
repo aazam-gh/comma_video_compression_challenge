@@ -190,36 +190,64 @@ def preload_video_pair_cache_dali(file_names, data_dir, batch_size, device, num_
         f = open(path, "rb")
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
         mv = memoryview(mm)
-        
+
         # Use the robust frame counter
         frames_count = hevc_frame_count(path) if path.endswith(".hevc") else container_frame_count(path)
-        
+
         it_size = math.ceil((frames_count // SEQ_LEN) / batch_size)
-        
+
         p = pipe(batch_size=batch_size, num_threads=num_threads, device_id=device.index or 0, prefetch_queue_depth=prefetch_queue_depth)
         p.build()
         p.feed_input("inbuf", [mv])
         it = DALIGenericIterator([p], output_map=["video"], auto_reset=False, last_batch_policy=LastBatchPolicy.PARTIAL)
         try:
-            for _ in range(it_size): 
+            for _ in range(it_size):
                 all_batches.append(next(it)[0]["video"].cpu().contiguous())
         finally:
             torch.cuda.synchronize()
             it.reset(); del it, p; mv.release(); mm.close(); f.close()
-            
+
     if not all_batches:
         raise RuntimeError("No video data was loaded. Please check if your video directory and file list are correct.")
-        
+
+    return torch.cat(all_batches, dim=0).contiguous()
+
+def preload_video_pair_cache_av(file_names, data_dir, batch_size, device):
+    """Fallback preloader using PyAV for non-CUDA environments."""
+    from frame_utils import yuv420_to_rgb
+    logging.info("Preloading raw video RGB pairs into memory via PyAV...")
+    all_batches = []
+    for fnm in file_names:
+        path = str(data_dir / fnm)
+        container = av.open(path)
+        stream = container.streams.video[0]
+        seq_buf = []
+        batch_buf = []
+        for frame in container.decode(stream):
+            arr = yuv420_to_rgb(frame)  # (H, W, 3) uint8
+            seq_buf.append(arr)
+            if len(seq_buf) == SEQ_LEN:
+                batch_buf.append(torch.stack(seq_buf))
+                seq_buf = []
+                if len(batch_buf) == batch_size:
+                    all_batches.append(torch.stack(batch_buf))
+                    batch_buf = []
+        if batch_buf:
+            all_batches.append(torch.stack(batch_buf))
+        container.close()
+    if not all_batches:
+        raise RuntimeError("No video data was loaded.")
     return torch.cat(all_batches, dim=0).contiguous()
 
 def extract_and_compress_masks(rgb_pairs_all, segnet, device, crf, archive_dir, batch_size=8):
-    expected_frames = rgb_pairs_all.shape[0]
-    
+    expected_pairs = rgb_pairs_all.shape[0]
+    expected_mask_frames = expected_pairs * 2  # Both frame1 and frame2 masks (interleaved)
+
     # Versioned filenames for caching
     raw_path = archive_dir / f"raw_masks_crf{crf}.yuv"
     obu_path = archive_dir / f"mask_crf{crf}.obu"
     obu_br_path = archive_dir / f"mask_crf{crf}.obu.br"
-    
+
     # Stable filename for inflate.py compatibility
     stable_obu_br_path = archive_dir / "mask.obu.br"
 
@@ -231,7 +259,7 @@ def extract_and_compress_masks(rgb_pairs_all, segnet, device, crf, archive_dir, 
                 with open(obu_br_path, "rb") as f_in:
                     tmp_obu.write(brotli.decompress(f_in.read()))
                 tmp_obu_path = tmp_obu.name
-            
+
             container = av.open(tmp_obu_path)
             frames = []
             for frame in container.decode(video=0):
@@ -240,54 +268,52 @@ def extract_and_compress_masks(rgb_pairs_all, segnet, device, crf, archive_dir, 
                 frames.append(cls_img)
             container.close()
             os.remove(tmp_obu_path)
-            
-            if len(frames) == expected_frames:
+
+            if len(frames) == expected_mask_frames:
                 logging.info(f"Cached video is complete ({len(frames)} frames). Skipping extraction.")
-                # Ensure the stable filename is up to date with this cached version
                 shutil.copyfile(obu_br_path, stable_obu_br_path)
-                return torch.from_numpy(np.stack(frames)).contiguous()
+                stacked = torch.from_numpy(np.stack(frames)).contiguous()
+                # Split interleaved: f1_pair0, f2_pair0, f1_pair1, f2_pair1, ...
+                mask1_all = stacked[0::2]  # frame1 masks
+                mask2_all = stacked[1::2]  # frame2 masks
+                return mask1_all, mask2_all
             else:
-                logging.warning(f"Cached video incomplete ({len(frames)}/{expected_frames} frames). Regenerating...")
+                logging.warning(f"Cached video incomplete ({len(frames)}/{expected_mask_frames} frames). Regenerating...")
         except Exception as e:
             logging.warning(f"Failed to load cached mask ({e}). Regenerating...")
 
-    # --- 2. Generation & Extraction ---
-    logging.info("Generating odd-frame raw masks from cached RGB pairs...")
+    # --- 2. Generation & Extraction (both frame1 and frame2 masks) ---
+    logging.info("Generating BOTH frame masks from cached RGB pairs...")
     with open(raw_path, "wb") as f_out:
         with torch.inference_mode():
-            for start in tqdm(range(0, expected_frames, batch_size), desc="Extracting Masks"):
+            for start in tqdm(range(0, expected_pairs, batch_size), desc="Extracting Masks"):
                 batch = rgb_pairs_all[start:start+batch_size].to(device).float()
                 batch = einops.rearrange(batch, 'b t h w c -> b t c h w')
-                odd_frames = batch[:, 1] 
-                
-                resized = torch.nn.functional.interpolate(
-                    odd_frames, 
-                    size=(SEGNET_MODEL_INPUT_SIZE[1], SEGNET_MODEL_INPUT_SIZE[0]), 
-                    mode='bilinear'
-                )
-                
-                out = segnet(resized)
-                mask = out.argmax(dim=1).to(torch.uint8)
-                mask_scaled = mask * 63 
-                f_out.write(mask_scaled.cpu().numpy().tobytes())
+
+                for frame_idx in [0, 1]:  # frame1 first, then frame2 (interleaved)
+                    frames = batch[:, frame_idx]
+                    resized = torch.nn.functional.interpolate(
+                        frames,
+                        size=(SEGNET_MODEL_INPUT_SIZE[1], SEGNET_MODEL_INPUT_SIZE[0]),
+                        mode='bilinear'
+                    )
+                    out = segnet(resized)
+                    mask = out.argmax(dim=1).to(torch.uint8)
+                    mask_scaled = mask * 63
+                    f_out.write(mask_scaled.cpu().numpy().tobytes())
 
     # --- 3. Compression ---
     logging.info(f"Compressing masks to OBU using FFmpeg (CRF {crf})...")
     ffmpeg_cmd = [
         get_ffmpeg_path(), "-y", "-hide_banner",
-        "-f", "rawvideo", "-pix_fmt", "gray", "-s", "512x384", 
-        "-r", "10", 
+        "-f", "rawvideo", "-pix_fmt", "gray", "-s", "512x384",
+        "-r", "10",
         "-i", str(raw_path),
-        "-c:v", "libaom-av1",
+        "-c:v", "libsvtav1",
         "-crf", str(crf),
-        "-cpu-used", "0",
-        "-row-mt", "1",
+        "-preset", "0",
         "-g", "1200",
         "-keyint_min", "1200",
-        "-lag-in-frames", "48",
-        "-arnr-strength", "0",
-        "-aq-mode", "0",
-        "-aom-params", "enable-cdef=0:enable-intrabc=1:enable-obmc=0",
         "-f", "obu",
         str(obu_path)
     ]
@@ -309,16 +335,19 @@ def extract_and_compress_masks(rgb_pairs_all, segnet, device, crf, archive_dir, 
         cls_img = np.clip(np.round(img / 63.0).astype(np.uint8), 0, 4)
         frames.append(cls_img)
     container.close()
-    
+
     # Completeness Check
-    if len(frames) != expected_frames:
-        raise RuntimeError(f"FFmpeg encoding failed! Generated {len(frames)} frames, expected {expected_frames}.")
-    
+    if len(frames) != expected_mask_frames:
+        raise RuntimeError(f"FFmpeg encoding failed! Generated {len(frames)} frames, expected {expected_mask_frames}.")
+
     # Cleanup temporary files (keep the .obu.br files)
     obu_path.unlink()
     raw_path.unlink()
-    
-    return torch.from_numpy(np.stack(frames)).contiguous()
+
+    stacked = torch.from_numpy(np.stack(frames)).contiguous()
+    mask1_all = stacked[0::2]  # frame1 masks
+    mask2_all = stacked[1::2]  # frame2 masks
+    return mask1_all, mask2_all
 
 def extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir, batch_size=8):
     br_path = archive_dir / "pose.npy.br"
@@ -347,11 +376,63 @@ def extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir, batc
         
     return torch.from_numpy(pose_arr).float().contiguous()
 
+def extract_and_compress_colors(rgb_pairs_all, archive_dir, color_h=32, color_w=48, batch_size=8):
+    """Extract low-resolution color thumbnails for all frames (both frame1 and frame2, interleaved)."""
+    br_path = archive_dir / "color.npy.br"
+    expected_pairs = rgb_pairs_all.shape[0]
+    expected_color_frames = expected_pairs * 2
+
+    # Cache check
+    if br_path.exists():
+        logging.info("Found cached color hints. Verifying completeness...")
+        try:
+            with open(br_path, "rb") as f_in:
+                color_bytes = brotli.decompress(f_in.read())
+            color_arr = np.load(io.BytesIO(color_bytes))
+            if color_arr.shape[0] == expected_color_frames:
+                logging.info(f"Cached colors complete ({color_arr.shape[0]} frames). Skipping.")
+                stacked = torch.from_numpy(color_arr).float().contiguous()
+                color1_all = stacked[0::2]
+                color2_all = stacked[1::2]
+                return color1_all, color2_all
+            else:
+                logging.warning(f"Cached colors incomplete. Regenerating...")
+        except Exception as e:
+            logging.warning(f"Failed to load cached colors ({e}). Regenerating...")
+
+    logging.info(f"Extracting low-res color thumbnails ({color_w}x{color_h})...")
+    all_colors = []
+    with torch.inference_mode():
+        for start in tqdm(range(0, expected_pairs, batch_size), desc="Extracting Colors"):
+            batch = rgb_pairs_all[start:start+batch_size].float()  # (B, 2, H, W, 3)
+            for frame_idx in [0, 1]:  # Interleaved: frame1, frame2
+                frame = batch[:, frame_idx].permute(0, 3, 1, 2)  # (B, C, H, W)
+                small = torch.nn.functional.interpolate(frame, size=(color_h, color_w), mode='bilinear')
+                all_colors.append(small.round().clamp(0, 255).to(torch.uint8).cpu().numpy())
+
+    color_arr = np.concatenate(all_colors, axis=0)
+
+    buffer = io.BytesIO()
+    np.save(buffer, color_arr)
+    buffer.seek(0)
+
+    logging.info("Applying Brotli compression to colors...")
+    with open(br_path, "wb") as f_out:
+        f_out.write(brotli.compress(buffer.read(), quality=11, lgwin=24))
+
+    stacked = torch.from_numpy(color_arr).float().contiguous()
+    color1_all = stacked[0::2]
+    color2_all = stacked[1::2]
+    return color1_all, color2_all
+
 class CachedPairLoader:
-    def __init__(self, rgb_pairs_cpu, mask2_cpu, pose6_cpu, batch_size, device, seed=123, shuffle=True):
+    def __init__(self, rgb_pairs_cpu, mask1_cpu, mask2_cpu, pose6_cpu, color1_cpu, color2_cpu, batch_size, device, seed=123, shuffle=True):
         self.rgb_pairs = rgb_pairs_cpu.contiguous()
+        self.mask1 = mask1_cpu.contiguous()
         self.mask2 = mask2_cpu.contiguous()
         self.pose6 = pose6_cpu.contiguous()
+        self.color1 = color1_cpu.contiguous()
+        self.color2 = color2_cpu.contiguous()
         self.batch_size = batch_size
         self.device = device
         self.seed = seed
@@ -369,8 +450,11 @@ class CachedPairLoader:
         for start in range(0, self.num_samples, self.batch_size):
             idx = perm[start : start + self.batch_size]
             yield (self.rgb_pairs.index_select(0, idx).to(self.device, non_blocking=True),
+                   self.mask1.index_select(0, idx).to(self.device, non_blocking=True),
                    self.mask2.index_select(0, idx).to(self.device, non_blocking=True),
-                   self.pose6.index_select(0, idx).to(self.device, non_blocking=True))
+                   self.pose6.index_select(0, idx).to(self.device, non_blocking=True),
+                   self.color1.index_select(0, idx).to(self.device, non_blocking=True),
+                   self.color2.index_select(0, idx).to(self.device, non_blocking=True))
 
 # -----------------------------
 # FP4 Logic
@@ -525,8 +609,34 @@ class FiLMSepResBlock(nn.Module):
         gamma, beta = self.film_proj(cond_emb).unsqueeze(-1).unsqueeze(-1).chunk(2, dim=1)
         return self.act(x + (x_base * (1.0 + gamma) + beta))
 
+class Mask1Encoder(nn.Module):
+    """Lightweight encoder for frame1's mask, providing richer input for the frame1 head."""
+    def __init__(self, num_classes=5, emb_dim=6, out_ch=80, depth_mult=2):
+        super().__init__()
+        self.embedding = QEmbedding(num_classes, emb_dim, quantize_weight=False)
+        self.stem = SepConvGNAct(emb_dim + 2, out_ch, depth_mult=depth_mult)
+        self.block = SepResBlock(out_ch, depth_mult=depth_mult)
+
+    def forward(self, mask1, coords):
+        e1 = self.embedding(mask1.long()).permute(0, 3, 1, 2)
+        e1_up = F.interpolate(e1, size=coords.shape[-2:], mode="bilinear", align_corners=False)
+        return self.block(self.stem(torch.cat([e1_up, coords], dim=1)))
+
+class ColorHintEncoder(nn.Module):
+    """Encodes low-resolution color thumbnails as conditioning features."""
+    def __init__(self, out_ch=32, depth_mult=2):
+        super().__init__()
+        self.encode = nn.Sequential(
+            SepConvGNAct(3, out_ch, depth_mult=depth_mult),
+            SepResBlock(out_ch, depth_mult=depth_mult),
+        )
+
+    def forward(self, color_hint):
+        x = F.interpolate(color_hint.float(), size=(384, 512), mode="bilinear", align_corners=False)
+        return self.encode(x)
+
 class SharedMaskDecoder(nn.Module):
-    def __init__(self, num_classes=5, emb_dim=6, c1=56, c2=64, depth_mult=1):
+    def __init__(self, num_classes=5, emb_dim=6, c1=80, c2=96, depth_mult=2):
         super().__init__()
         self.embedding = QEmbedding(num_classes, emb_dim, quantize_weight=False)
         self.stem_conv = SepConvGNAct(emb_dim + 2, c1, depth_mult=depth_mult)
@@ -563,32 +673,61 @@ class FrameHead(nn.Module):
     def forward(self, feat, cond_emb): return torch.sigmoid(self.head(self.pre(self.block2(self.block1(feat, cond_emb))))) * 255.0
 
 class JointFrameGenerator(nn.Module):
-    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=1):
+    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=2,
+                 c1=80, c2=96, use_mask1=True, use_color=True, color_ch=32):
         super().__init__()
-        self.shared_trunk = SharedMaskDecoder(num_classes=num_classes, emb_dim=6, c1=56, c2=64, depth_mult=depth_mult)
+        self.use_mask1 = use_mask1
+        self.use_color = use_color
+        self.shared_trunk = SharedMaskDecoder(num_classes=num_classes, emb_dim=6, c1=c1, c2=c2, depth_mult=depth_mult)
+
+        if use_mask1:
+            self.mask1_encoder = Mask1Encoder(num_classes=num_classes, emb_dim=6, out_ch=c1, depth_mult=depth_mult)
+        if use_color:
+            self.color_encoder = ColorHintEncoder(out_ch=color_ch, depth_mult=depth_mult)
+
         self.pose_mlp = nn.Sequential(nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
-        self.frame1_head = FrameHead(in_ch=56, cond_dim=cond_dim, hidden=52, depth_mult=depth_mult)
-        self.frame2_head = Frame2StaticHead(in_ch=56, hidden=52, depth_mult=depth_mult)
+
+        f1_ch = c1 + (c1 if use_mask1 else 0) + (color_ch if use_color else 0)
+        f2_ch = c1 + (color_ch if use_color else 0)
+        self.frame1_head = FrameHead(in_ch=f1_ch, cond_dim=cond_dim, hidden=c1, depth_mult=depth_mult)
+        self.frame2_head = Frame2StaticHead(in_ch=f2_ch, hidden=c1, depth_mult=depth_mult)
 
     def set_qat(self, enabled: bool):
         for m in self.modules():
             if isinstance(m, (QConv2d, QEmbedding)): m.set_qat(enabled=enabled)
 
-    def forward(self, mask2, pose6):
+    def forward(self, mask2, pose6, mask1=None, color1=None, color2=None):
         coords = make_coord_grid(mask2.shape[0], 384, 512, mask2.device, torch.float32)
         shared_feat = self.shared_trunk(mask2, coords)
-        return self.frame1_head(shared_feat, self.pose_mlp(pose6)), self.frame2_head(shared_feat)
+
+        f2_parts = [shared_feat]
+        if self.use_color and color2 is not None:
+            f2_parts.append(self.color_encoder(color2))
+        pred_frame2 = self.frame2_head(torch.cat(f2_parts, dim=1))
+
+        f1_parts = [shared_feat]
+        if self.use_mask1 and mask1 is not None:
+            f1_parts.append(self.mask1_encoder(mask1, coords))
+        if self.use_color and color1 is not None:
+            f1_parts.append(self.color_encoder(color1))
+        pred_frame1 = self.frame1_head(torch.cat(f1_parts, dim=1), self.pose_mlp(pose6))
+
+        return pred_frame1, pred_frame2
 
 # -----------------------------
 # Freeze Control & Training Engine
 # -----------------------------
 def apply_freeze_state(model: JointFrameGenerator, stage: Stage):
     for p in model.parameters(): p.requires_grad = True
-    
+
     if stage == Stage.ANCHOR:
-        logging.info("STAGE: ANCHOR -> Freezing Frame 1 and Pose.")
+        logging.info("STAGE: ANCHOR -> Freezing Frame 1, Pose, Mask1, Color encoders.")
         for p in model.frame1_head.parameters(): p.requires_grad = False
         for p in model.pose_mlp.parameters(): p.requires_grad = False
+        if hasattr(model, 'mask1_encoder'):
+            for p in model.mask1_encoder.parameters(): p.requires_grad = False
+        if hasattr(model, 'color_encoder'):
+            for p in model.color_encoder.parameters(): p.requires_grad = False
     elif stage == Stage.FINETUNE:
         logging.info("STAGE: FINETUNE -> Freezing Shared Trunk and Frame 2.")
         for p in model.shared_trunk.parameters(): p.requires_grad = False
@@ -655,9 +794,11 @@ def train_run(run: PipelineRun, generator: JointFrameGenerator, loader: CachedPa
         total_loss_sum, total_seg2_ce, total_seg1_ce, total_pose_dist, batches = 0.0, 0.0, 0.0, 0.0, 0
 
         pbar = tqdm(loader, desc=f"Run: {run.name} | Epoch {epoch+1}/{run.epochs}", leave=False)
-        for batch_rgb, in_mask2, in_pose6 in pbar:
+        for batch_rgb, in_mask1, in_mask2, in_pose6, in_color1, in_color2 in pbar:
             batch = einops.rearrange(batch_rgb, "b t h w c -> b t c h w").float().to(device)
-            in_mask2, in_pose6 = in_mask2.to(device).long(), in_pose6.to(device).float()
+            in_mask1, in_mask2 = in_mask1.to(device).long(), in_mask2.to(device).long()
+            in_pose6 = in_pose6.to(device).float()
+            in_color1, in_color2 = in_color1.to(device).float(), in_color2.to(device).float()
 
             with torch.no_grad():
                 real1 = F.interpolate(batch[:, 0], size=(384, 512), mode="bilinear", align_corners=False)
@@ -665,9 +806,12 @@ def train_run(run: PipelineRun, generator: JointFrameGenerator, loader: CachedPa
                 gt_logits1, gt_logits2 = segnet(real1).float(), segnet(real2).float()
                 gt_mask1, gt_mask2 = gt_logits1.argmax(dim=1), gt_logits2.argmax(dim=1)
                 gt_pose = get_pose_tensor(posenet(posenet.preprocess_input(batch))).float()[..., :6]
+                # Feature-level distillation targets from SegNet encoder
+                gt_enc_feats2 = segnet.encoder(real2)
+                gt_enc_feats1 = segnet.encoder(real1)
 
             optimizer.zero_grad(set_to_none=True)
-            pred_frame1, pred_frame2 = generator(in_mask2, in_pose6)
+            pred_frame1, pred_frame2 = generator(in_mask2, in_pose6, mask1=in_mask1, color1=in_color1, color2=in_color2)
 
             fake1_up = F.interpolate(pred_frame1, size=(874, 1164), mode="bilinear", align_corners=False)
             fake2_up = F.interpolate(pred_frame2, size=(874, 1164), mode="bilinear", align_corners=False)
@@ -675,7 +819,7 @@ def train_run(run: PipelineRun, generator: JointFrameGenerator, loader: CachedPa
             fake2_down = F.interpolate(diff_round(fake2_up.clamp(0, 255)), size=(384, 512), mode="bilinear", align_corners=False)
 
             loss, loss_pose, loss_seg2, loss_seg1 = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
-            loss_seg2_ce, loss_seg1_ce = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            loss_seg2_ce, loss_seg1_ce, loss_feat = torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
             if run.stage in [Stage.FINETUNE, Stage.JOINT]:
                 fake_pose = get_pose_tensor(posenet(pack_pair_yuv6(fake1_down, fake2_down).float())).float()[..., :6]
@@ -690,22 +834,39 @@ def train_run(run: PipelineRun, generator: JointFrameGenerator, loader: CachedPa
                 loss_seg2_kl = kl_on_logits(fake_logits2, gt_logits2, 2.0) / (384 * 512)
                 loss_seg2 = 100.0 * ((seg2_kl_w * loss_seg2_kl) + (seg2_ce_w * 0.5 * run.ce_weight * loss_seg2_ce))
 
+                # Feature-level distillation: match SegNet encoder intermediate features
+                fake_enc_feats2 = segnet.encoder(fake2_down)
+                for gt_f, fk_f in zip(gt_enc_feats2, fake_enc_feats2):
+                    loss_feat = loss_feat + F.mse_loss(fk_f, gt_f.detach()) * 0.1
+                loss_seg2 = loss_seg2 + loss_feat
+
             if frame1_sem_w > 0:
                 fake_logits1 = segnet(fake1_down).float()
                 ce_unreduced1 = F.cross_entropy(fake_logits1, gt_mask1, reduction='none')
                 with torch.no_grad():
                     boost1 = 1.0 + ((fake_logits1.argmax(dim=1) != gt_mask1).float() * run.error_boost)
                 loss_seg1_ce = (ce_unreduced1 * boost1).mean()
-                
+
                 if run.stage == Stage.JOINT:
                     loss_seg1_kl = kl_on_logits(fake_logits1, gt_logits1, 2.0) / (384 * 512)
                     loss_seg1 = 100.0 * frame1_sem_w * ((seg2_kl_w * loss_seg1_kl) + (seg2_ce_w * 0.5 * run.ce_weight * loss_seg1_ce))
-                else: 
+                    # Feature distillation for frame1
+                    fake_enc_feats1 = segnet.encoder(fake1_down)
+                    for gt_f, fk_f in zip(gt_enc_feats1, fake_enc_feats1):
+                        loss_seg1 = loss_seg1 + F.mse_loss(fk_f, gt_f.detach()) * 0.1 * frame1_sem_w
+                else:
                     loss_seg1 = 100.0 * frame1_sem_w * (run.ce_weight * loss_seg1_ce)
 
+            # Score-optimal loss weighting:
+            # segnet weight = 100 (linear), posenet weight = sqrt(10)/(2*sqrt(pose_dist+eps))
+            # This matches the gradient of the actual score formula
             if run.stage == Stage.ANCHOR: loss = loss_seg2
-            elif run.stage == Stage.FINETUNE: loss = loss_seg1 + (run.pose_weight * loss_pose * 10.0)
-            elif run.stage == Stage.JOINT: loss = loss_seg2 + loss_seg1 + (30.0 * run.pose_weight * loss_pose)
+            elif run.stage == Stage.FINETUNE:
+                pose_grad_weight = math.sqrt(10.0) / (2.0 * math.sqrt(loss_pose.item() + 1e-8))
+                loss = loss_seg1 + (min(pose_grad_weight, 80.0) * run.pose_weight * loss_pose)
+            elif run.stage == Stage.JOINT:
+                pose_grad_weight = math.sqrt(10.0) / (2.0 * math.sqrt(loss_pose.item() + 1e-8))
+                loss = loss_seg2 + loss_seg1 + (min(pose_grad_weight, 80.0) * run.pose_weight * loss_pose)
 
             assert_finite("loss", loss)
             loss.backward()
@@ -736,9 +897,11 @@ def train_run(run: PipelineRun, generator: JointFrameGenerator, loader: CachedPa
             
             with torch.inference_mode():
                 eval_pbar = tqdm(loader, desc=f"Eval: {run.name} Ep {epoch+1}", leave=False)
-                for batch_rgb, in_mask2, in_pose6 in eval_pbar:
+                for batch_rgb, in_mask1, in_mask2, in_pose6, in_color1, in_color2 in eval_pbar:
                     batch_gt = batch_rgb.to(device)
-                    p1, p2 = generator(in_mask2.to(device).long(), in_pose6.to(device).float())
+                    p1, p2 = generator(in_mask2.to(device).long(), in_pose6.to(device).float(),
+                                       mask1=in_mask1.to(device).long(),
+                                       color1=in_color1.to(device).float(), color2=in_color2.to(device).float())
                     
                     b_comp = torch.stack([F.interpolate(p1, size=(874, 1164), mode="bilinear", align_corners=False), 
                                           F.interpolate(p2, size=(874, 1164), mode="bilinear", align_corners=False)], dim=1)
@@ -758,10 +921,12 @@ def train_run(run: PipelineRun, generator: JointFrameGenerator, loader: CachedPa
             model_size = model_file.stat().st_size if model_file.exists() else 1500000 # ~1.5MB fallback estimate
             mask_file = archive_dir / "mask.obu.br"
             mask_size = mask_file.stat().st_size if mask_file.exists() else 0
-            pose_file = archive_dir / "poses.npy.br"
+            pose_file = archive_dir / "pose.npy.br"
             pose_size = pose_file.stat().st_size if pose_file.exists() else 0
-            
-            total_bytes = model_size + mask_size + pose_size
+            color_file = archive_dir / "color.npy.br"
+            color_size = color_file.stat().st_size if color_file.exists() else 0
+
+            total_bytes = model_size + mask_size + pose_size + color_size
             total_pixels = samples * 2 * 1164 * 874
             rate_bpp = (total_bytes * 8.0) / max(1, total_pixels)
             
@@ -821,12 +986,20 @@ def parse_args():
     p.add_argument("--video-names", type=Path, default=ROOT_DIR / "public_test_video_names.txt")
     p.add_argument("--crf", type=int, default=50, help="CRF value for AV1 OBU mask compression")
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--device", type=str, default=None)
     return p.parse_args()
 
 def main():
     args = parse_args()
-    device = torch.device(args.device)
+    if args.device is not None:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda:0")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    logging.info(f"Using device: {device}")
     
     archive_dir = Path(__file__).parent / "archive"
     archive_dir.mkdir(exist_ok=True, parents=True)
@@ -846,14 +1019,18 @@ def main():
 
     # --- 1. PRELOAD DATA TO RAM ---
     files = [line.strip() for line in args.video_names.read_text().splitlines() if line.strip()]
-    rgb_pairs_all = preload_video_pair_cache_dali(files, args.video_dir, args.batch_size, device)
+    if device.type == "cuda":
+        rgb_pairs_all = preload_video_pair_cache_dali(files, args.video_dir, args.batch_size, device)
+    else:
+        rgb_pairs_all = preload_video_pair_cache_av(files, args.video_dir, args.batch_size, device)
 
-    # --- 2. EXTRACT MASKS & POSES ---
-    mask_frames_all = extract_and_compress_masks(rgb_pairs_all, segnet, device, args.crf, archive_dir)
+    # --- 2. EXTRACT MASKS (both frames), POSES, AND COLORS ---
+    mask1_all, mask2_all = extract_and_compress_masks(rgb_pairs_all, segnet, device, args.crf, archive_dir)
     pose6_all = extract_and_compress_poses(rgb_pairs_all, posenet, device, archive_dir)
+    color1_all, color2_all = extract_and_compress_colors(rgb_pairs_all, archive_dir)
 
     # Initialize Train Loader
-    loader = CachedPairLoader(rgb_pairs_all, mask_frames_all, pose6_all, args.batch_size, device)
+    loader = CachedPairLoader(rgb_pairs_all, mask1_all, mask2_all, pose6_all, color1_all, color2_all, args.batch_size, device)
     generator = JointFrameGenerator().to(device)
 
     # --- 3. PIPELINE EXECUTION ---

@@ -137,8 +137,32 @@ class FiLMSepResBlock(nn.Module):
 
         return self.act(residual + x)
 
+class Mask1Encoder(nn.Module):
+    def __init__(self, num_classes=5, emb_dim=6, out_ch=80, depth_mult=2):
+        super().__init__()
+        self.embedding = QEmbedding(num_classes, emb_dim, quantize_weight=False)
+        self.stem = SepConvGNAct(emb_dim + 2, out_ch, depth_mult=depth_mult)
+        self.block = SepResBlock(out_ch, depth_mult=depth_mult)
+
+    def forward(self, mask1, coords):
+        e1 = self.embedding(mask1.long()).permute(0, 3, 1, 2)
+        e1_up = F.interpolate(e1, size=coords.shape[-2:], mode="bilinear", align_corners=False)
+        return self.block(self.stem(torch.cat([e1_up, coords], dim=1)))
+
+class ColorHintEncoder(nn.Module):
+    def __init__(self, out_ch=32, depth_mult=2):
+        super().__init__()
+        self.encode = nn.Sequential(
+            SepConvGNAct(3, out_ch, depth_mult=depth_mult),
+            SepResBlock(out_ch, depth_mult=depth_mult),
+        )
+
+    def forward(self, color_hint):
+        x = F.interpolate(color_hint.float(), size=(384, 512), mode="bilinear", align_corners=False)
+        return self.encode(x)
+
 class SharedMaskDecoder(nn.Module):
-    def __init__(self, num_classes=5, emb_dim=6, c1=40, c2=44, depth_mult=4):
+    def __init__(self, num_classes=5, emb_dim=6, c1=80, c2=96, depth_mult=2):
         super().__init__()
         self.embedding = QEmbedding(num_classes, emb_dim, quantize_weight=False)
 
@@ -168,7 +192,7 @@ class SharedMaskDecoder(nn.Module):
         return f
 
 class Frame2StaticHead(nn.Module):
-    def __init__(self, in_ch: int, hidden: int = 36, depth_mult: int = 4):
+    def __init__(self, in_ch: int, hidden: int = 80, depth_mult: int = 2):
         super().__init__()
         self.block1 = SepResBlock(in_ch, depth_mult=depth_mult)
         self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
@@ -182,7 +206,7 @@ class Frame2StaticHead(nn.Module):
         return torch.sigmoid(self.head(x)) * 255.0
 
 class FrameHead(nn.Module):
-    def __init__(self, in_ch: int, cond_dim: int = 32, hidden: int = 36, depth_mult: int = 4):
+    def __init__(self, in_ch: int, cond_dim: int = 48, hidden: int = 80, depth_mult: int = 2):
         super().__init__()
         self.block1 = FiLMSepResBlock(in_ch, cond_dim, depth_mult=depth_mult)
         self.block2 = SepResBlock(in_ch, depth_mult=depth_mult)
@@ -196,29 +220,49 @@ class FrameHead(nn.Module):
         return torch.sigmoid(self.head(x)) * 255.0
 
 class JointFrameGenerator(nn.Module):
-    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=1):
+    def __init__(self, num_classes=5, pose_dim=6, cond_dim=48, depth_mult=2,
+                 c1=80, c2=96, use_mask1=True, use_color=True, color_ch=32):
         super().__init__()
+        self.use_mask1 = use_mask1
+        self.use_color = use_color
         self.shared_trunk = SharedMaskDecoder(
-            num_classes=num_classes, emb_dim=6, c1=56, c2=64, depth_mult=depth_mult)
+            num_classes=num_classes, emb_dim=6, c1=c1, c2=c2, depth_mult=depth_mult)
+
+        if use_mask1:
+            self.mask1_encoder = Mask1Encoder(num_classes=num_classes, emb_dim=6, out_ch=c1, depth_mult=depth_mult)
+        if use_color:
+            self.color_encoder = ColorHintEncoder(out_ch=color_ch, depth_mult=depth_mult)
 
         self.pose_mlp = nn.Sequential(
             nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
 
-        self.frame1_head = FrameHead(
-            in_ch=56, cond_dim=cond_dim, hidden=52, depth_mult=depth_mult)
+        f1_ch = c1 + (c1 if use_mask1 else 0) + (color_ch if use_color else 0)
+        f2_ch = c1 + (color_ch if use_color else 0)
 
-        self.frame2_head = Frame2StaticHead(
-            in_ch=56, hidden=52, depth_mult=depth_mult)
+        self.frame1_head = FrameHead(in_ch=f1_ch, cond_dim=cond_dim, hidden=c1, depth_mult=depth_mult)
+        self.frame2_head = Frame2StaticHead(in_ch=f2_ch, hidden=c1, depth_mult=depth_mult)
 
-    def forward(self, mask2: torch.Tensor, pose6: torch.Tensor):
+    def forward(self, mask2: torch.Tensor, pose6: torch.Tensor,
+                mask1=None, color1=None, color2=None):
         b = mask2.shape[0]
         coords = make_coord_grid(b, 384, 512, mask2.device, torch.float32)
 
         shared_feat = self.shared_trunk(mask2, coords)
-        pred_frame2 = self.frame2_head(shared_feat)
 
+        # Frame 2: shared + optional color
+        f2_parts = [shared_feat]
+        if self.use_color and color2 is not None:
+            f2_parts.append(self.color_encoder(color2))
+        pred_frame2 = self.frame2_head(torch.cat(f2_parts, dim=1))
+
+        # Frame 1: shared + optional mask1 + optional color + pose
+        f1_parts = [shared_feat]
+        if self.use_mask1 and mask1 is not None:
+            f1_parts.append(self.mask1_encoder(mask1, coords))
+        if self.use_color and color1 is not None:
+            f1_parts.append(self.color_encoder(color1))
         cond_emb = self.pose_mlp(pose6)
-        pred_frame1 = self.frame1_head(shared_feat, cond_emb)
+        pred_frame1 = self.frame1_head(torch.cat(f1_parts, dim=1), cond_emb)
 
         return pred_frame1, pred_frame2
 
@@ -260,17 +304,18 @@ def main():
     model_br = data_dir / "model.pt.br"
     mask_br = data_dir / "mask.obu.br"
     pose_br = data_dir / "pose.npy.br"
- 
+    color_br = data_dir / "color.npy.br"
+
     generator = JointFrameGenerator().to(device)
 
     # 1. Load Weights
     with open(model_br, "rb") as f:
         weights_data = brotli.decompress(f.read())
-    
+
     generator.load_state_dict(get_decoded_state_dict(weights_data, device), strict=True)
     generator.eval()
 
-    # 2. Load Mask Video (.obu)
+    # 2. Load Mask Video (.obu) - contains interleaved frame1 + frame2 masks
     with tempfile.NamedTemporaryFile(suffix=".obu", delete=False) as tmp_obu:
         with open(mask_br, "rb") as f:
             tmp_obu.write(brotli.decompress(f.read()))
@@ -279,36 +324,68 @@ def main():
     mask_frames_all = load_encoded_mask_video(tmp_obu_path)
     os.remove(tmp_obu_path)
 
+    # Split interleaved masks: f1_pair0, f2_pair0, f1_pair1, f2_pair1, ...
+    mask1_all = mask_frames_all[0::2]  # frame1 masks
+    mask2_all = mask_frames_all[1::2]  # frame2 masks
+
     # 3. Load Pose Vectors
     with open(pose_br, "rb") as f:
         pose_bytes = brotli.decompress(f.read())
     pose_frames_all = torch.from_numpy(np.load(io.BytesIO(pose_bytes))).float()
 
+    # 4. Load Color Hints (optional)
+    color1_all, color2_all = None, None
+    if color_br.exists():
+        with open(color_br, "rb") as f:
+            color_bytes = brotli.decompress(f.read())
+        color_all = torch.from_numpy(np.load(io.BytesIO(color_bytes))).float()
+        color1_all = color_all[0::2]  # frame1 colors
+        color2_all = color_all[1::2]  # frame2 colors
+
     out_h, out_w = 874, 1164
     cursor = 0
-    batch_size = 4 
-    
-    # 1 mask per generated pair, assume 600 pairs per standard 1200 frame chunk.
+    batch_size = 4
+
+    # 1 mask pair per generated pair, assume 600 pairs per standard 1200 frame chunk.
     pairs_per_file = 600
+
+    # Test-time optimization: run gradient steps to refine outputs
+    TTO_STEPS = 0  # Set > 0 to enable (e.g., 5-20 steps)
+    TTO_LR = 1e-3
 
     with torch.inference_mode():
         for file_name in files:
             base_name = os.path.splitext(file_name)[0]
             raw_out_path = out_dir / f"{base_name}.raw"
-            
-            # Retrieve exactly the pairs mapping to this file
-            file_masks = mask_frames_all[cursor : cursor + pairs_per_file]
-            file_poses = pose_frames_all[cursor : cursor + pairs_per_file]
-            cursor += pairs_per_file
-            
-            with open(raw_out_path, "wb") as f_out:
-                pbar = tqdm(range(0, file_masks.shape[0], batch_size), desc=f"Decoding {file_name}")
-                
-                for i in pbar:
-                    in_mask2 = file_masks[i : i + batch_size].to(device).long()
-                    in_pose6 = file_poses[i : i + batch_size].to(device).float()
 
-                    fake1, fake2 = generator(in_mask2, in_pose6)
+            file_mask1 = mask1_all[cursor : cursor + pairs_per_file]
+            file_mask2 = mask2_all[cursor : cursor + pairs_per_file]
+            file_poses = pose_frames_all[cursor : cursor + pairs_per_file]
+            file_color1 = color1_all[cursor : cursor + pairs_per_file] if color1_all is not None else None
+            file_color2 = color2_all[cursor : cursor + pairs_per_file] if color2_all is not None else None
+            cursor += pairs_per_file
+
+            with open(raw_out_path, "wb") as f_out:
+                pbar = tqdm(range(0, file_mask2.shape[0], batch_size), desc=f"Decoding {file_name}")
+
+                for i in pbar:
+                    in_mask1 = file_mask1[i : i + batch_size].to(device).long()
+                    in_mask2 = file_mask2[i : i + batch_size].to(device).long()
+                    in_pose6 = file_poses[i : i + batch_size].to(device).float()
+                    in_color1 = file_color1[i : i + batch_size].to(device).float() if file_color1 is not None else None
+                    in_color2 = file_color2[i : i + batch_size].to(device).float() if file_color2 is not None else None
+
+                    fake1, fake2 = generator(in_mask2, in_pose6,
+                                              mask1=in_mask1,
+                                              color1=in_color1, color2=in_color2)
+
+                    # Test-time optimization: refine frames with gradient steps
+                    if TTO_STEPS > 0:
+                        fake1, fake2 = test_time_optimize(
+                            generator, fake1, fake2,
+                            in_mask1, in_mask2, in_pose6,
+                            in_color1, in_color2,
+                            device, TTO_STEPS, TTO_LR)
 
                     fake1_up = F.interpolate(fake1, size=(out_h, out_w), mode="bilinear", align_corners=False)
                     fake2_up = F.interpolate(fake2, size=(out_h, out_w), mode="bilinear", align_corners=False)
@@ -318,6 +395,46 @@ def main():
 
                     output_bytes = batch_comp.clamp(0, 255).round().to(torch.uint8)
                     f_out.write(output_bytes.cpu().numpy().tobytes())
+
+
+def test_time_optimize(generator, fake1_init, fake2_init,
+                        mask1, mask2, pose6, color1, color2,
+                        device, steps=10, lr=1e-3):
+    """Test-time optimization: refine generated frames with gradient descent.
+
+    We optimize a latent perturbation added to the generator output
+    to minimize reconstruction consistency with the masks and poses.
+    """
+    # Create learnable perturbations
+    delta1 = torch.zeros_like(fake1_init, requires_grad=True)
+    delta2 = torch.zeros_like(fake2_init, requires_grad=True)
+    optimizer = torch.optim.Adam([delta1, delta2], lr=lr)
+
+    for _ in range(steps):
+        optimizer.zero_grad()
+        f1 = (fake1_init + delta1).clamp(0, 255)
+        f2 = (fake2_init + delta2).clamp(0, 255)
+
+        # Re-run through generator to get consistent features
+        pred1, pred2 = generator(mask2, pose6, mask1=mask1, color1=color1, color2=color2)
+
+        # Loss: smoothness (total variation) + consistency with initial output
+        tv_loss = total_variation(delta1) + total_variation(delta2)
+        consistency = F.mse_loss(f1, pred1.detach()) + F.mse_loss(f2, pred2.detach())
+
+        loss = consistency + 0.01 * tv_loss
+        loss.backward()
+        optimizer.step()
+
+    return (fake1_init + delta1).detach().clamp(0, 255), (fake2_init + delta2).detach().clamp(0, 255)
+
+
+def total_variation(x):
+    """Total variation regularization for smoothness."""
+    diff_h = x[:, :, 1:, :] - x[:, :, :-1, :]
+    diff_w = x[:, :, :, 1:] - x[:, :, :, :-1]
+    return diff_h.pow(2).mean() + diff_w.pow(2).mean()
+
 
 if __name__ == "__main__":
     main()
